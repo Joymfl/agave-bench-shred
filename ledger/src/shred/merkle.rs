@@ -1265,9 +1265,12 @@ fn finish_erasure_batch(
     }
     match thread_pool {
         None => shreds.iter_mut().try_for_each(write_headers),
-        Some(thread_pool) => {
-            thread_pool.install(|| shreds.par_iter_mut().try_for_each(write_headers))
-        }
+        Some(thread_pool) => thread_pool.install(|| {
+            shreds
+                .par_iter_mut()
+                .with_min_len(4)
+                .try_for_each(write_headers)
+        }),
     }?;
     // Fill in erasure code buffers in the coding shreds.
     let CodingShredHeader {
@@ -1306,6 +1309,7 @@ fn finish_erasure_batch(
         Some(thread_pool) => MerkleTree::try_new(thread_pool.install(|| {
             shreds
                 .par_iter()
+                .with_min_len(4)
                 .map(Shred::merkle_node)
                 .collect::<Vec<_>>()
                 .into_iter()
