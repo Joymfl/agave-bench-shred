@@ -1309,7 +1309,8 @@ fn finish_erasure_batch(
         Some(thread_pool) => MerkleTree::try_new(thread_pool.install(|| {
             shreds
                 .par_iter()
-                .with_min_len(4)
+                .with_min_len(4) // For testing purposes, ideally should be dynamic
+                // based on threads allocated by pool
                 .map(Shred::merkle_node)
                 .collect::<Vec<_>>()
                 .into_iter()
