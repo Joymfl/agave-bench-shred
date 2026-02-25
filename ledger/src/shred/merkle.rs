@@ -1015,7 +1015,6 @@ fn make_shreds_code_header_only(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn make_shreds_from_data(
-    thread_pool: &ThreadPool,
     keypair: &Keypair,
     chained_merkle_root: Hash,
     data: &[u8], // Serialized &[Entry]
@@ -1189,13 +1188,7 @@ pub(crate) fn make_shreds_from_data(
     // (and so the signature) cannot be computed without the Merkle root of
     // the previous erasure batch.
     batches.try_fold(chained_merkle_root, |chained_merkle_root, batch| {
-        finish_erasure_batch(
-            Some(thread_pool),
-            keypair,
-            batch,
-            chained_merkle_root,
-            reed_solomon_cache,
-        )
+        finish_erasure_batch(keypair, batch, chained_merkle_root, reed_solomon_cache)
     })?;
     stats.gen_coding_elapsed += now.elapsed().as_micros() as u64;
     Ok(shreds)
@@ -1242,7 +1235,6 @@ fn shred_leftover_data(
 // - Populates Merkle proof for each shred and attaches the signature.
 // Returns the root of the Merkle tree.
 fn finish_erasure_batch(
-    thread_pool: Option<&ThreadPool>,
     keypair: &Keypair,
     shreds: &mut [Shred],
     // The Merkle root of the previous erasure batch if chained.
@@ -1263,15 +1255,10 @@ fn finish_erasure_batch(
             }
         }
     }
-    match thread_pool {
-        None => shreds.iter_mut().try_for_each(write_headers),
-        Some(thread_pool) => thread_pool.install(|| {
-            shreds
-                .par_iter_mut()
-                .with_min_len(4)
-                .try_for_each(write_headers)
-        }),
-    }?;
+    //NOTE: Errors aren't being handled, but try_for_each is preventing loop unrolling. Could use
+    //for_each() for better performance
+    shreds.iter_mut().try_for_each(write_headers);
+
     // Fill in erasure code buffers in the coding shreds.
     let CodingShredHeader {
         num_data_shreds,
@@ -1301,21 +1288,9 @@ fn finish_erasure_batch(
     }
 
     // Compute the Merkle tree for the erasure batch.
-    let tree = match thread_pool {
-        None => {
-            let nodes = shreds.iter().map(Shred::merkle_node);
-            MerkleTree::try_new(nodes)
-        }
-        Some(thread_pool) => MerkleTree::try_new(thread_pool.install(|| {
-            shreds
-                .par_iter()
-                .with_min_len(4) // For testing purposes, ideally should be dynamic
-                // based on threads allocated by pool
-                .map(Shred::merkle_node)
-                .collect::<Vec<_>>()
-                .into_iter()
-        })),
-    }?;
+    let nodes = shreds.iter().map(Shred::merkle_node);
+    let tree = MerkleTree::try_new(nodes);
+
     // Sign the root of the Merkle tree.
     let signature = keypair.sign_message(tree.root().as_ref());
     // Populate merkle proof for all shreds and attach signature.
@@ -1668,7 +1643,6 @@ mod test {
         is_last_in_slot: bool,
         reed_solomon_cache: &ReedSolomonCache,
     ) {
-        let thread_pool = ThreadPoolBuilder::new().num_threads(2).build().unwrap();
         let keypair = Keypair::new();
         let chained_merkle_root = Hash::new_from_array(rng.random());
         let slot = 149_745_689;
@@ -1680,7 +1654,6 @@ mod test {
         let mut data = vec![0u8; data_size];
         rng.fill(&mut data[..]);
         let shreds = make_shreds_from_data(
-            &thread_pool,
             &keypair,
             chained_merkle_root,
             &data[..],

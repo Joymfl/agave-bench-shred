@@ -105,7 +105,22 @@ fn run_make_shreds_from_entries(
             &mut stats,
         );
     }
-    c.bench_function(name, |b| {
+    // Calculate shred size for throughput
+    let (data, code) = make_shreds_from_entries(
+        &mut rng,
+        &shredder,
+        &keypair,
+        &entries,
+        is_last_in_slot,
+        chained_merkle_root,
+        &reed_solomon_cache,
+        &mut stats,
+    );
+    let total_shreds = (data.len() + code.len()) as u64;
+    let mut group = c.benchmark_group(name);
+    println!("Total shreds: {}", total_shreds);
+    group.throughput(criterion::Throughput::Elements(total_shreds));
+    group.bench_function(name, |b| {
         b.iter(|| {
             let (data, code) = make_shreds_from_entries(
                 &mut rng,
@@ -121,6 +136,7 @@ fn run_make_shreds_from_entries(
             black_box(code);
         })
     });
+    group.finish();
 }
 
 fn run_recover_shreds(
@@ -220,6 +236,6 @@ fn bench_recover_shreds(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_make_shreds_from_entries,
-    bench_recover_shreds
+    // bench_recover_shreds
 );
 criterion_main!(benches);

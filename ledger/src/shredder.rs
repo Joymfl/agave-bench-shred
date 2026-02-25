@@ -17,14 +17,6 @@ use {
     },
 };
 
-static PAR_THREAD_POOL: std::sync::LazyLock<ThreadPool> = std::sync::LazyLock::new(|| {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(get_thread_count())
-        .thread_name(|i| format!("solShredder{i:02}"))
-        .build()
-        .unwrap()
-});
-
 // Arc<...> wrapper so that cache entries can be initialized without locking
 // the entire cache.
 type LruCacheOnce<K, V> = RwLock<LruCache<K, Arc<OnceLock<V>>>>;
@@ -134,9 +126,7 @@ impl Shredder {
         reed_solomon_cache: &ReedSolomonCache,
         stats: &mut ProcessShredsStats,
     ) -> Result<impl Iterator<Item = Shred> + use<>, Error> {
-        let thread_pool: &ThreadPool = &PAR_THREAD_POOL;
         let shreds = shred::merkle::make_shreds_from_data(
-            thread_pool,
             keypair,
             chained_merkle_root,
             data,
