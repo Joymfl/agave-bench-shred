@@ -236,6 +236,6 @@ fn bench_recover_shreds(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_make_shreds_from_entries,
-    // bench_recover_shreds
+    bench_recover_shreds
 );
 criterion_main!(benches);

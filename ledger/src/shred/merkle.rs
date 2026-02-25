@@ -20,7 +20,6 @@ use {
     },
     assert_matches::debug_assert_matches,
     itertools::{Either, Itertools},
-    rayon::{ThreadPool, prelude::*},
     reed_solomon_erasure::Error::{InvalidIndex, TooFewParityShards},
     solana_clock::Slot,
     solana_hash::Hash,
@@ -42,7 +41,7 @@ const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, 1203);
 const_assert_eq!(ShredCode::SIZE_OF_PAYLOAD, 1228);
 
 // Layout: {common, data} headers | data buffer
-//     | [Merkle root of the previous erasure batch if chained]
+//     | [Merkle root of the previous erasxre batch if chained]
 //     | Merkle proof
 //     | [Retransmitter's signature if resigned]
 // The slice past signature till the end of the data buffer is erasure coded.
@@ -1255,9 +1254,8 @@ fn finish_erasure_batch(
             }
         }
     }
-    //NOTE: Errors aren't being handled, but try_for_each is preventing loop unrolling. Could use
-    //for_each() for better performance
-    shreds.iter_mut().try_for_each(write_headers);
+
+    shreds.iter_mut().try_for_each(write_headers)?;
 
     // Fill in erasure code buffers in the coding shreds.
     let CodingShredHeader {
@@ -1289,7 +1287,7 @@ fn finish_erasure_batch(
 
     // Compute the Merkle tree for the erasure batch.
     let nodes = shreds.iter().map(Shred::merkle_node);
-    let tree = MerkleTree::try_new(nodes);
+    let tree = MerkleTree::try_new(nodes)?;
 
     // Sign the root of the Merkle tree.
     let signature = keypair.sign_message(tree.root().as_ref());
@@ -1317,8 +1315,7 @@ mod test {
         crate::shred::{ShredFlags, ShredId, merkle_tree::get_proof_size},
         assert_matches::assert_matches,
         itertools::Itertools,
-        rand::{CryptoRng, Rng, seq::SliceRandom},
-        rayon::ThreadPoolBuilder,
+        rand::{seq::SliceRandom, CryptoRng, Rng},
         reed_solomon_erasure::Error::TooFewShardsPresent,
         solana_keypair::Keypair,
         solana_packet::PACKET_DATA_SIZE,
