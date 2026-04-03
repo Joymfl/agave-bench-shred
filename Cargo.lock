@@ -7349,8 +7349,11 @@ dependencies = [
  "clap 2.33.3",
  "console 0.16.3",
  "const_format",
+ "dashmap",
+ "futures-util",
  "hex",
  "humantime",
+ "indicatif",
  "log",
  "num-traits",
  "pretty-hex",
@@ -7408,6 +7411,7 @@ dependencies = [
  "solana-system-interface 3.1.0",
  "solana-test-validator",
  "solana-tpu-client",
+ "solana-tpu-client-next",
  "solana-transaction",
  "solana-transaction-error",
  "solana-transaction-status",
@@ -7419,6 +7423,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tiny-bip39",
  "tokio",
+ "tokio-util 0.7.18",
+ "wincode",
 ]
 
 [[package]]

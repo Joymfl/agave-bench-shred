@@ -14,6 +14,8 @@ use {
     agave_feature_set::{FEATURE_NAMES, FeatureSet},
     bip39::{Language, Mnemonic, MnemonicType, Seed},
     clap::{App, AppSettings, Arg, ArgMatches, SubCommand},
+    dashmap::DashMap,
+    futures_util::future::join_all,
     log::*,
     solana_account::state_traits::StateMut,
     solana_account_decoder::{UiAccount, UiAccountEncoding, UiDataSliceConfig},
@@ -36,7 +38,9 @@ use {
     solana_client::{
         connection_cache::ConnectionCache,
         send_and_confirm_transactions_in_parallel::{
-            SendAndConfirmConfigV2, send_and_confirm_transactions_in_parallel_v2,
+            BlockHashData, SEND_INTERVAL, SEND_TIMEOUT_INTERVAL, SendAndConfirmConfigV2,
+            SendingContext, TransactionData, create_blockhash_data_updating_task,
+            create_transaction_confirmation_task, send_and_confirm_transactions_in_parallel_v2,
         },
     },
     solana_commitment_config::CommitmentConfig,
@@ -53,21 +57,31 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_remote_wallet::remote_wallet::RemoteWalletManager,
-    solana_rpc_client::nonblocking::rpc_client::RpcClient,
+    solana_rpc_client::{
+        nonblocking::rpc_client::RpcClient,
+        spinner::{self, SendTransactionProgress},
+    },
     solana_rpc_client_api::{
-        client_error::ErrorKind as ClientErrorKind,
-        config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
+        client_error::{ErrorKind, ErrorKind as ClientErrorKind},
+        config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig},
         filter::{Memcmp, RpcFilterType},
-        request::MAX_MULTIPLE_ACCOUNTS,
+        request::{MAX_MULTIPLE_ACCOUNTS, RpcError, RpcResponseErrorData},
+        response::RpcSimulateTransactionResult,
     },
     solana_rpc_client_nonce_utils::nonblocking::blockhash_query::BlockhashQuery,
     solana_sbpf::{elf::Executable, verifier::RequisiteVerifier},
     solana_sdk_ids::{bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, compute_budget},
     solana_signature::Signature,
-    solana_signer::Signer,
+    solana_signer::{Signer, SignerError, signers::Signers},
     solana_syscalls::create_program_runtime_environment,
     solana_system_interface::{MAX_PERMITTED_DATA_LENGTH, error::SystemError},
-    solana_tpu_client::tpu_client::TpuClientConfig,
+    solana_tpu_client::tpu_client::{Result as TpuResult, TpuClientConfig, TpuSenderError},
+    solana_tpu_client_next::{
+        Client, ClientBuilder, TransactionSender,
+        node_address_service::{self, LeaderTpuCacheServiceConfig, NodeAddressService},
+        transaction_batch::TransactionBatch,
+        websocket_node_address_service::WebsocketNodeAddressService,
+    },
     solana_transaction::Transaction,
     solana_transaction_error::TransactionError,
     std::{
@@ -78,8 +92,15 @@ use {
         path::PathBuf,
         rc::Rc,
         str::FromStr,
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        },
+        time::{Duration, Instant},
     },
+    tokio::sync::RwLock,
+    tokio_util::sync::CancellationToken,
+    wincode::serialize,
 };
 
 pub const CLOSE_PROGRAM_WARNING: &str = "WARNING! Closed programs cannot be recreated at the same \
@@ -2562,6 +2583,7 @@ async fn do_process_program_deploy(
     max_sign_attempts: usize,
     use_rpc: bool,
 ) -> ProcessResult {
+    let start = Instant::now();
     let blockhash = rpc_client.get_latest_blockhash().await?;
     let compute_unit_limit = ComputeUnitLimit::Simulated;
 
@@ -2674,6 +2696,10 @@ async fn do_process_program_deploy(
     )
     .await?;
 
+    eprintln!(
+        "deploy_metric,process_program_deploy,{}",
+        start.elapsed().as_micros()
+    );
     let program_id = CliProgramId {
         program_id: program_signers[0].pubkey().to_string(),
         signature: final_tx_sig.as_ref().map(ToString::to_string),
@@ -3102,6 +3128,7 @@ async fn send_deploy_messages(
     use_rpc: bool,
     compute_unit_limit: &ComputeUnitLimit,
 ) -> Result<Option<Signature>, Box<dyn std::error::Error>> {
+    let mut start = Instant::now();
     if let Some(mut message) = initial_message {
         if let Some(initial_signer) = initial_signer {
             trace!("Preparing the required accounts");
@@ -3168,61 +3195,78 @@ async fn send_deploy_messages(
                     }
                 }
             }
+            let node_address_service = WebsocketNodeAddressService::run(
+                rpc_client.clone(),
+                config.websocket_url.clone(),
+                LeaderTpuCacheServiceConfig::default(),
+                CancellationToken::new(),
+            )
+            .await?;
 
-            let connection_cache = {
-                #[cfg(feature = "dev-context-only-utils")]
-                let cache =
-                    ConnectionCache::new_quic_for_tests("connection_cache_cli_program_quic", 1);
-                #[cfg(not(feature = "dev-context-only-utils"))]
-                let cache = ConnectionCache::new_quic("connection_cache_cli_program_quic", 1);
-                cache
-            };
-            let transaction_errors = match connection_cache {
-                ConnectionCache::Udp(cache) => {
-                    solana_tpu_client::nonblocking::tpu_client::TpuClient::new_with_connection_cache(
-                        rpc_client.clone(),
-                        &config.websocket_url,
-                        TpuClientConfig::default(),
-                        cache,
-                    )
-                    .await?
-                    .send_and_confirm_messages_with_spinner(
-                        &write_messages,
-                        &[fee_payer_signer, write_signer],
-                    )
-                    .await
-                }
-                ConnectionCache::Quic(cache) => {
-                    // `solana_client` type currently required by `send_and_confirm_transactions_in_parallel_v2`
-                    let tpu_client_fut = solana_client::nonblocking::tpu_client::TpuClient::new_with_connection_cache(
-                        rpc_client.clone(),
-                        config.websocket_url.as_str(),
-                        TpuClientConfig::default(),
-                        cache,
-                    );
-                    let tpu_client = if use_rpc {
-                        None
-                    } else {
-                        Some(
-                            tpu_client_fut
-                                .await
-                                .expect("Should return a valid tpu client"),
-                        )
-                    };
-                    send_and_confirm_transactions_in_parallel_v2(
-                        rpc_client.clone(),
-                        tpu_client,
-                        &write_messages,
-                        &[fee_payer_signer, write_signer],
-                        SendAndConfirmConfigV2 {
-                            resign_txs_count: Some(max_sign_attempts),
-                            with_spinner: true,
-                            rpc_send_transaction_config: config.send_transaction_config,
-                        },
-                    )
-                    .await
-                }
-            }
+            // TODO: Is this the best way? this will just find any available port
+            let bind_socket =
+                std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind UDP socket");
+            let (transaction_sender, client) = ClientBuilder::new(Box::new(node_address_service))
+                .bind_socket(bind_socket)
+                .build()
+                .expect("Failed to build TPU client");
+            //NOTE: Post deploy metric
+            start = Instant::now();
+
+            // let connection_cache = {
+            //     #[cfg(feature = "dev-context-only-utils")]
+            //     let cache =
+            //         ConnectionCache::new_quic_for_tests("connection_cache_cli_program_quic", 1);
+            //     #[cfg(not(feature = "dev-context-only-utils"))]
+            //     let cache = ConnectionCache::new_quic("connection_cache_cli_program_quic", 1);
+            //     cache
+            // };
+            // let transaction_errors = match connection_cache {
+            //     ConnectionCache::Udp(cache) => {
+            //         solana_tpu_client::nonblocking::tpu_client::TpuClient::new_with_connection_cache(
+            //             rpc_client.clone(),
+            //             &config.websocket_url,
+            //             TpuClientConfig::default(),
+            //             cache,
+            //         )
+            //         .await?
+            //         .send_and_confirm_messages_with_spinner(
+            //             &write_messages,
+            //             &[fee_payer_signer, write_signer],
+            //         )
+            //         .await
+            //     }
+            //     ConnectionCache::Quic(cache) => {
+            //         // `solana_client` type currently required by `send_and_confirm_transactions_in_parallel_v2`
+            //         let tpu_client_fut = solana_client::nonblocking::tpu_client::TpuClient::new_with_connection_cache(
+            //             rpc_client.clone(),
+            //             config.websocket_url.as_str(),
+            //             TpuClientConfig::default(),
+            //             cache,
+            //         );
+            //         let tpu_client = if use_rpc {
+            //             None
+            //         } else {
+            //             Some(
+            //                 tpu_client_fut
+            //                     .await
+            //                     .expect("Should return a valid tpu client"),
+            //             )
+            //         };
+            // TODO(Joy) -> Implement send_and_confirm for tpu-client-next
+            let transaction_errors = send_and_confirm_parallel_tpu_next(
+                rpc_client.clone(),
+                &transaction_sender,
+                &client,
+                &write_messages,
+                &[fee_payer_signer, write_signer],
+                SendAndConfirmConfigV2 {
+                    resign_txs_count: Some(max_sign_attempts),
+                    with_spinner: true,
+                    rpc_send_transaction_config: config.send_transaction_config,
+                },
+            )
+            .await
             .map_err(|err| format!("Data writes to account failed: {err}"))?
             .into_iter()
             .flatten()
@@ -3263,9 +3307,369 @@ async fn send_deploy_messages(
         }
     }
 
+    eprintln!(
+        "deploy_metric,deploy_message,{}",
+        start.elapsed().as_micros()
+    );
     Ok(None)
 }
 
+async fn send_and_confirm_parallel_tpu_next<T: Signers + ?Sized>(
+    rpc_client: Arc<RpcClient>,
+    transaction_sender: &TransactionSender,
+    tpu_client: &Client,
+    messages: &[Message],
+    signers: &T,
+    config: SendAndConfirmConfigV2,
+) -> TpuResult<Vec<Option<TransactionError>>> {
+    // get current blockhash and corresponding last valid block height
+    let (blockhash, last_valid_block_height) = rpc_client
+        .get_latest_blockhash_with_commitment(rpc_client.commitment())
+        .await?;
+    let blockhash_data_rw = Arc::new(RwLock::new(BlockHashData {
+        blockhash,
+        last_valid_block_height,
+    }));
+
+    // check if all the messages are signable by the signers
+    // NOTE (Joy)-> This is expensive, does it need to happen here? I guess it should before we try
+    // to send over the network to avoid transaction fees for obviously failing transactions
+    messages
+        .iter()
+        .map(|x| {
+            let mut transaction = Transaction::new_unsigned(x.clone());
+            transaction.try_sign(signers, blockhash)
+        })
+        .collect::<std::result::Result<Vec<()>, SignerError>>()?;
+    // NOTE: Messages was a slice, for transaction needed heap alloc
+
+    let serialized_messages: Vec<Vec<u8>> = messages
+        .iter()
+        .map(|msg| serialize(msg).expect("Failed to serialize message"))
+        .collect();
+    let transaction_batch = TransactionBatch::new(serialized_messages);
+
+    // get current block height
+    let block_height = rpc_client.get_block_height().await?;
+    let current_block_height = Arc::new(AtomicU64::new(block_height));
+
+    // TODO: spinner type missing. need impl. Could avoid for v1
+    let progress_bar = config.with_spinner.then(|| {
+        let progress_bar = spinner::new_progress_bar();
+        progress_bar.set_message("Setting up...");
+        progress_bar
+    });
+
+    // blockhash and block height update task
+    let block_data_task = create_blockhash_data_updating_task(
+        rpc_client.clone(),
+        blockhash_data_rw.clone(),
+        current_block_height.clone(),
+    );
+
+    let unconfirmed_transasction_map = Arc::new(DashMap::<Signature, TransactionData>::new());
+    let error_map = Arc::new(DashMap::new());
+    let num_confirmed_transactions = Arc::new(AtomicUsize::new(0));
+    // tasks which confirms the transactions that were sent
+    let transaction_confirming_task = create_transaction_confirmation_task(
+        rpc_client.clone(),
+        current_block_height.clone(),
+        unconfirmed_transasction_map.clone(),
+        error_map.clone(),
+        num_confirmed_transactions.clone(),
+    );
+
+    // transaction sender task
+    let total_transactions = messages.len();
+    let mut initial = true;
+    let signing_count = config.resign_txs_count.unwrap_or(1);
+    let context = SendingContext {
+        unconfirmed_transaction_map: unconfirmed_transasction_map.clone(),
+        blockhash_data_rw: blockhash_data_rw.clone(),
+        num_confirmed_transactions: num_confirmed_transactions.clone(),
+        current_block_height: current_block_height.clone(),
+        error_map: error_map.clone(),
+        total_transactions,
+    };
+
+    for expired_blockhash_retries in (0..signing_count).rev() {
+        // only send messages which have not been confirmed
+        let messages_with_index: Vec<(usize, Message)> = if initial {
+            initial = false;
+            messages.iter().cloned().enumerate().collect()
+        } else {
+            // remove all the confirmed transactions
+            unconfirmed_transasction_map
+                .iter()
+                .map(|x| (x.index, x.message.clone()))
+                .collect()
+        };
+
+        if messages_with_index.is_empty() {
+            break;
+        }
+
+        // clear the map so that we can start resending
+        unconfirmed_transasction_map.clear();
+
+        sign_all_messages_and_send_tpu_next(
+            &progress_bar,
+            &rpc_client,
+            transaction_sender,
+            tpu_client,
+            messages_with_index,
+            signers,
+            &context,
+            config.rpc_send_transaction_config,
+        )
+        .await?;
+        confirm_transactions_till_block_height_and_resend_unexpired_transaction_over_tpu_next(
+            &progress_bar,
+            transaction_sender,
+            Some(tpu_client),
+            &context,
+        )
+        .await;
+
+        if unconfirmed_transasction_map.is_empty() {
+            break;
+        }
+
+        if let Some(progress_bar) = &progress_bar {
+            progress_bar.println(format!(
+                "Blockhash expired. {expired_blockhash_retries} retries remaining"
+            ));
+        }
+    }
+
+    block_data_task.abort();
+    transaction_confirming_task.abort();
+    if unconfirmed_transasction_map.is_empty() {
+        let mut transaction_errors = vec![None; messages.len()];
+        for iterator in error_map.iter() {
+            transaction_errors[*iterator.key()] = Some(iterator.value().clone());
+        }
+        Ok(transaction_errors)
+    } else {
+        Err(TpuSenderError::Custom("Max retries exceeded".into()))
+    }
+}
+async fn sign_all_messages_and_send_tpu_next<T: Signers + ?Sized>(
+    // TODO: Could remove this arg for draft
+    progress_bar: &Option<indicatif::ProgressBar>,
+    rpc_client: &RpcClient,
+    transaction_sender: &TransactionSender,
+    tpu_client: &Client,
+    messages_with_index: Vec<(usize, Message)>,
+    signers: &T,
+    context: &SendingContext,
+    rpc_send_transaction_config: RpcSendTransactionConfig,
+) -> TpuResult<()> {
+    let current_transaction_count = messages_with_index.len();
+    let mut futures = vec![];
+    // send all the transaction messages
+    for (counter, (index, message)) in messages_with_index.iter().enumerate() {
+        let mut transaction = Transaction::new_unsigned(message.clone());
+        futures.push(async move {
+            tokio::time::sleep(SEND_INTERVAL.saturating_mul(counter as u32)).await;
+            let blockhashdata = *context.blockhash_data_rw.read().await;
+
+            // we have already checked if all transactions are signable.
+            transaction
+                .try_sign(signers, blockhashdata.blockhash)
+                .expect("Transaction should be signable");
+            let serialized_transaction =
+                serialize(&transaction).expect("Transaction should serialize");
+            let signature = transaction.signatures[0];
+
+            // send to confirm the transaction
+            context.unconfirmed_transaction_map.insert(
+                signature,
+                TransactionData {
+                    index: *index,
+                    serialized_transaction: serialized_transaction.clone(),
+                    last_valid_block_height: blockhashdata.last_valid_block_height,
+                    message: message.clone(),
+                },
+            );
+            // if let Some(progress_bar) = progress_bar {
+            //     let progress = progress_from_context_and_block_height(
+            //         context,
+            //         blockhashdata.last_valid_block_height,
+            //     );
+            //     progress.set_message_for_confirmed_transactions(
+            //         progress_bar,
+            //         &format!(
+            //             "Sending {}/{} transactions",
+            //             counter + 1,
+            //             current_transaction_count,
+            //         ),
+            //     );
+            // }
+            send_transaction_with_rpc_fallback_tpu_next(
+                rpc_client,
+                Some(transaction_sender),
+                Some(tpu_client),
+                transaction,
+                serialized_transaction,
+                context,
+                *index,
+                rpc_send_transaction_config,
+            )
+            .await
+        });
+    }
+    // collect to convert Vec<Result<_>> to Result<Vec<_>>
+    join_all(futures)
+        .await
+        .into_iter()
+        .collect::<TpuResult<Vec<()>>>()?;
+    Ok(())
+}
+
+async fn send_transaction_with_rpc_fallback_tpu_next(
+    rpc_client: &RpcClient,
+    transaction_sender: Option<&TransactionSender>,
+    tpu_client: Option<&Client>,
+    transaction: Transaction,
+    serialized_transaction: Vec<u8>,
+    context: &SendingContext,
+    index: usize,
+    rpc_send_transaction_config: RpcSendTransactionConfig,
+) -> TpuResult<()> {
+    let send_over_rpc = if let Some(tpu_client) = tpu_client {
+        !tokio::time::timeout(
+            SEND_TIMEOUT_INTERVAL,
+            transaction_sender
+                .unwrap()
+                .send_transactions_in_batch(vec![serialized_transaction]),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false)
+    } else {
+        true
+    };
+    if send_over_rpc {
+        if let Err(e) = rpc_client
+            .send_transaction_with_config(
+                &transaction,
+                RpcSendTransactionConfig {
+                    preflight_commitment: Some(rpc_client.commitment().commitment),
+                    ..rpc_send_transaction_config
+                },
+            )
+            .await
+        {
+            match e.kind() {
+                ErrorKind::Io(_) | ErrorKind::Reqwest(_) => {
+                    // fall through on io error, we will retry the transaction
+                }
+                ErrorKind::TransactionError(TransactionError::BlockhashNotFound) => {
+                    // fall through so that we will resend with another blockhash
+                }
+                ErrorKind::TransactionError(transaction_error) => {
+                    // if we get other than blockhash not found error the transaction is invalid
+                    context.error_map.insert(index, transaction_error.clone());
+                }
+                ErrorKind::RpcError(RpcError::RpcResponseError {
+                    data:
+                        RpcResponseErrorData::SendTransactionPreflightFailure(
+                            RpcSimulateTransactionResult {
+                                err: Some(ui_transaction_error),
+                                ..
+                            },
+                        ),
+                    ..
+                }) => {
+                    match TransactionError::from(ui_transaction_error.clone()) {
+                        TransactionError::BlockhashNotFound => {
+                            // fall through so that we will resend with another blockhash
+                        }
+                        err => {
+                            // if we get other than blockhash not found error the transaction is invalid
+                            context.error_map.insert(index, err);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(TpuSenderError::from(e));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+async fn confirm_transactions_till_block_height_and_resend_unexpired_transaction_over_tpu_next(
+    progress_bar: &Option<indicatif::ProgressBar>,
+    transaction_sender: &TransactionSender,
+    tpu_client: Option<&Client>,
+    context: &SendingContext,
+) {
+    let unconfirmed_transaction_map = context.unconfirmed_transaction_map.clone();
+    let current_block_height = context.current_block_height.clone();
+
+    let transactions_to_confirm = unconfirmed_transaction_map.len();
+    let max_valid_block_height = unconfirmed_transaction_map
+        .iter()
+        .map(|x| x.last_valid_block_height)
+        .max();
+
+    if let Some(mut max_valid_block_height) = max_valid_block_height {
+        if let Some(progress_bar) = progress_bar {
+            let progress = progress_from_context_and_block_height(context, max_valid_block_height);
+            progress.set_message_for_confirmed_transactions(
+                progress_bar,
+                &format!(
+                    "Waiting for next block, {transactions_to_confirm} transactions pending..."
+                ),
+            );
+        }
+
+        // wait till all transactions are confirmed or we have surpassed max processing age for the last sent transaction
+        while !unconfirmed_transaction_map.is_empty()
+            && current_block_height.load(Ordering::Relaxed) <= max_valid_block_height
+        {
+            let block_height = current_block_height.load(Ordering::Relaxed);
+
+            if let Some(tpu_client) = tpu_client {
+                // retry sending transaction only over TPU port
+                // any transactions sent over RPC will be automatically rebroadcast by the RPC server
+                let txs_to_resend_over_tpu = unconfirmed_transaction_map
+                    .iter()
+                    .filter(|x| block_height < x.last_valid_block_height)
+                    .map(|x| x.serialized_transaction.clone())
+                    .collect::<Vec<_>>();
+                transaction_sender.try_send_transactions_in_batch(txs_to_resend_over_tpu);
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if let Some(max_valid_block_height_in_remaining_transaction) =
+                unconfirmed_transaction_map
+                    .iter()
+                    .map(|x| x.last_valid_block_height)
+                    .max()
+            {
+                max_valid_block_height = max_valid_block_height_in_remaining_transaction;
+            }
+        }
+    }
+}
+fn progress_from_context_and_block_height(
+    context: &SendingContext,
+    last_valid_block_height: u64,
+) -> SendTransactionProgress {
+    SendTransactionProgress {
+        confirmed_transactions: context
+            .num_confirmed_transactions
+            .load(std::sync::atomic::Ordering::Relaxed),
+        total_transactions: context.total_transactions,
+        block_height: context
+            .current_block_height
+            .load(std::sync::atomic::Ordering::Relaxed),
+        last_valid_block_height,
+    }
+}
 fn create_ephemeral_keypair()
 -> Result<(usize, bip39::Mnemonic, Keypair), Box<dyn std::error::Error>> {
     const WORDS: usize = 12;
