@@ -3294,23 +3294,22 @@ async fn send_deploy_messages(
             let mut signers = final_signers.to_vec();
             signers.push(fee_payer_signer);
             final_tx.try_sign(&signers, blockhash)?;
-            return Ok(Some(
-                rpc_client
-                    .send_and_confirm_transaction_with_spinner_and_config(
-                        &final_tx,
-                        config.commitment,
-                        config.send_transaction_config,
-                    )
-                    .await
-                    .map_err(|e| format!("Deploying program failed: {e}"))?,
-            ));
+            let result = rpc_client
+                .send_and_confirm_transaction_with_spinner_and_config(
+                    &final_tx,
+                    config.commitment,
+                    config.send_transaction_config,
+                )
+                .await
+                .map_err(|e| format!("Deploying program failed: {e}"))?;
+            eprintln!(
+                "deploy_metric,deploy_message,{}",
+                start.elapsed().as_micros()
+            );
+            return Ok(Some(result));
         }
     }
 
-    eprintln!(
-        "deploy_metric,deploy_message,{}",
-        start.elapsed().as_micros()
-    );
     Ok(None)
 }
 
