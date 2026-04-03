@@ -32,24 +32,24 @@ use {
 };
 
 const BLOCKHASH_REFRESH_RATE: Duration = Duration::from_secs(5);
-const SEND_INTERVAL: Duration = Duration::from_millis(10);
+pub const SEND_INTERVAL: Duration = Duration::from_millis(10);
 // This is a "reasonable" constant for how long it should
 // take to fan the transactions out, taken from
 // `solana_tpu_client::nonblocking::tpu_client::send_wire_transaction_futures`
-const SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
+pub const SEND_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
 
 type QuicTpuClient = TpuClient<QuicPool, QuicConnectionManager, QuicConfig>;
 
 #[derive(Clone, Debug)]
-struct TransactionData {
-    last_valid_block_height: u64,
-    message: Message,
-    index: usize,
-    serialized_transaction: Vec<u8>,
+pub struct TransactionData {
+    pub last_valid_block_height: u64,
+    pub message: Message,
+    pub index: usize,
+    pub serialized_transaction: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Copy)]
-struct BlockHashData {
+pub struct BlockHashData {
     pub blockhash: Hash,
     pub last_valid_block_height: u64,
 }
@@ -80,7 +80,7 @@ pub fn send_and_confirm_transactions_in_parallel_blocking_v2<T: Signers + ?Sized
     tokio::task::block_in_place(|| rpc_client.runtime().block_on(fut))
 }
 
-fn create_blockhash_data_updating_task(
+pub fn create_blockhash_data_updating_task(
     rpc_client: Arc<RpcClient>,
     blockhash_data_rw: Arc<RwLock<BlockHashData>>,
     current_block_height: Arc<AtomicU64>,
@@ -105,7 +105,7 @@ fn create_blockhash_data_updating_task(
     })
 }
 
-fn create_transaction_confirmation_task(
+pub fn create_transaction_confirmation_task(
     rpc_client: Arc<RpcClient>,
     current_block_height: Arc<AtomicU64>,
     unconfirmed_transaction_map: Arc<DashMap<Signature, TransactionData>>,
@@ -166,13 +166,13 @@ fn create_transaction_confirmation_task(
 }
 
 #[derive(Clone, Debug)]
-struct SendingContext {
-    unconfirmed_transaction_map: Arc<DashMap<Signature, TransactionData>>,
-    error_map: Arc<DashMap<usize, TransactionError>>,
-    blockhash_data_rw: Arc<RwLock<BlockHashData>>,
-    num_confirmed_transactions: Arc<AtomicUsize>,
-    total_transactions: usize,
-    current_block_height: Arc<AtomicU64>,
+pub struct SendingContext {
+    pub unconfirmed_transaction_map: Arc<DashMap<Signature, TransactionData>>,
+    pub error_map: Arc<DashMap<usize, TransactionError>>,
+    pub blockhash_data_rw: Arc<RwLock<BlockHashData>>,
+    pub num_confirmed_transactions: Arc<AtomicUsize>,
+    pub total_transactions: usize,
+    pub current_block_height: Arc<AtomicU64>,
 }
 fn progress_from_context_and_block_height(
     context: &SendingContext,
