@@ -1397,12 +1397,18 @@ async fn process_program_deploy(
         fetch_feature_set(&rpc_client).await?
     };
 
+    // NOTE(Joy) -> Not sure if this logic needs this structure. do_initial_deploy checks if there's
+    // an already deployed program. This should just check if:
+    // 1 ) if initial_deploy -> read from disk and deploy
+    // 2 ) if upgrade. That means -> program deployed, grab buffer from rpc and upgrade.
     let (program_data, program_len, buffer_program_data) =
         if let Some(program_location) = program_location {
             let program_data = read_and_verify_elf(program_location, feature_set)?;
             let program_len = program_data.len();
 
             // If a buffer was provided, check if it has already been created and set up properly
+            // NOTE(Joy) -> Doesn't this only happen if there's a buffer already? should've been
+            // checked at previous do_initial_deploy logic
             let buffer_program_data = if buffer_provided {
                 fetch_buffer_program_data(
                     &rpc_client,
@@ -1432,6 +1438,7 @@ async fn process_program_deploy(
             return Err("Program location required if buffer not supplied".into());
         };
 
+    // NOTE(Joy) -> Why can't this be short circuited early?
     let program_data_max_len = if let Some(len) = max_len {
         if program_len > len {
             return Err(
@@ -1449,6 +1456,8 @@ async fn process_program_deploy(
         ))
         .await?;
 
+    // NOTE(Joy): could this not be merged with above loop logic?
+    // Stems from the idea that if do_initial_deploy is true: it's on disk vs if false then on chain
     let result = if do_initial_deploy {
         if program_signer.is_none() {
             return Err(
@@ -1509,6 +1518,11 @@ async fn process_program_deploy(
         )
         .await?;
     }
+    // NOTE(Joy) -> a calculation for ephemeral keypair is done at the very beginning of this
+    // method, just to save time on error reporting here.
+    // Possible solution. Take error as unhappy path which can take longer. Store to buffer if fails
+    // in early logic, only then should be used here
+    // Can the same ephemeral keypair be generated twice?
     if result.is_err() && !buffer_provided {
         // We might have deployed "temporary" buffer but failed to deploy our program from this
         // buffer, reporting this to the user - so he can retry deploying re-using same buffer.
@@ -2540,7 +2554,7 @@ async fn process_extend_program(
 }
 
 pub fn calculate_max_chunk_size(baseline_msg: Message) -> usize {
-    let tx_size = bincode::serialized_size(&Transaction {
+    let tx_size = wincode::serialized_size(&Transaction {
         signatures: vec![
             Signature::default();
             baseline_msg.header.num_required_signatures as usize
@@ -2573,9 +2587,13 @@ async fn do_process_program_deploy(
 ) -> ProcessResult {
     let start = Instant::now();
     let blockhash = rpc_client.get_latest_blockhash().await?;
+    // NOTE(Joy) -> Worth adding SimulatedWithExtraPercentage to account for drift is target is
+    // reliability
     let compute_unit_limit = ComputeUnitLimit::Simulated;
 
     let (initial_instructions, balance_needed, buffer_program_data) =
+        //NOTE(Joy): What's the point of this conditional check? in `process_program_deploy`, the
+        // two paths always have buffer_program_data present.
         if let Some(buffer_program_data) = buffer_program_data {
             (vec![], 0, buffer_program_data)
         } else {
@@ -2632,6 +2650,8 @@ async fn do_process_program_deploy(
 
     // Create and add final message
     let final_message = {
+        // NOTE(Joy): Should bump solana-loader-v3-interface to 7.0.0 for wincode compatibility.
+        // Current version falls to using bincode
         #[allow(deprecated)]
         let instructions = loader_v3_instruction::deploy_with_max_program_len(
             &fee_payer_signer.pubkey(),
@@ -2835,6 +2855,8 @@ async fn do_process_program_upgrade(
                 (vec![], 0, buffer_program_data)
             } else {
                 (
+                    // NOTE(Joy): Loader v3 instruction is pinned here to 7.0.0 , which only
+                    // supports bincode
                     loader_v3_instruction::create_buffer(
                         &fee_payer_signer.pubkey(),
                         &buffer_signer.pubkey(),
@@ -3193,7 +3215,6 @@ async fn send_deploy_messages(
             )
             .await?;
 
-            // TODO: Is this the best way? this will just find any available port
             let bind_socket =
                 std::net::UdpSocket::bind("0.0.0.0:0").expect("Failed to bind UDP socket");
             let (transaction_sender, client) = ClientBuilder::new(Box::new(node_address_service))
@@ -3273,6 +3294,7 @@ async fn send_deploy_messages(
         }
     }
 
+    // NOTE(Joy): If write messages are empty, should this logic run?
     if let Some(mut message) = final_message {
         if let Some(final_signers) = final_signers {
             trace!("Deploying program");
